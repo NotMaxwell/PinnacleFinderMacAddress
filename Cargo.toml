@@ -2,12 +2,8 @@
 name = "PinnacleFinderMacAddress"
 version = "0.1.0"
 edition = "2024"
+default-run = "PinnacleFinderMacAddress"
 
 [dependencies]
-crossterm = "0.29.0"
-etherparse = "0.19.0"
-hex = "0.4.3"
-iced = { version = "0.13.1", features = ["wgpu", "tiny-skia", "advanced"] }
 pcap = "2.3.0"
-radiotap = "1.3.0"
-ratatui = "0.29.0"
+eframe = "0.33.2"
