@@ -3,8 +3,9 @@ use pcap::{Capture, Device};
 
 use std::sync::{mpsc, Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::fmt::Write as FmtWrite;
+use std::process::Command;
 
 #[derive(Clone, Debug)]
 struct ScanUpdate {
@@ -28,6 +29,9 @@ struct GuiApp {
     total_frames: u64,
     hits: u64,
     start_time: Option<Instant>,
+
+    auto_channel: Option<u8>,
+    channel_note: Option<String>,
 
     rx: Option<mpsc::Receiver<ScanUpdate>>,
     stop_flag: Option<Arc<AtomicBool>>,
@@ -53,6 +57,130 @@ fn log_debug(msg: &str) {
     }
 }
 
+fn set_channel_airport(iface: &str, channel: u8) -> Result<(), String> {
+    let output = Command::new("/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport")
+        .arg(iface)
+        .arg("--channel")
+        .arg(channel.to_string())
+        .output()
+        .map_err(|e| format!("failed to run airport: {e}"))?;
+
+    if !output.status.success() {
+        return Err(format!(
+            "airport returned status {} with stderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(())
+}
+
+fn scan_airport_channels() -> Option<Vec<(String, u8)>> {
+    let output = Command::new("/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport")
+        .arg("-s")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut rows = Vec::new();
+    for line in stdout.lines().skip(1) {
+        // Try to find a BSSID token (xx:xx:xx:xx:xx:xx) and a channel number near it
+        let tokens: Vec<&str> = line.split_whitespace().collect();
+        let mut bssid_idx = None;
+        for (i, t) in tokens.iter().enumerate() {
+            if t.len() == 17 && t.matches(':').count() == 5 {
+                bssid_idx = Some(i);
+                break;
+            }
+        }
+        let Some(idx) = bssid_idx else { continue };
+        if idx + 1 >= tokens.len() { continue; }
+        let bssid = tokens[idx].to_string();
+        if let Ok(ch) = tokens[idx + 1].parse::<u8>() {
+            rows.push((bssid, ch));
+        }
+    }
+    if rows.is_empty() { None } else { Some(rows) }
+}
+
+fn packet_contains_mac(data: &[u8], target: &[u8; 6]) -> bool {
+    if let Some((src, _)) = extract_80211_src_mac_and_rssi(data) {
+        if &src == target {
+            return true;
+        }
+    }
+    data.windows(6).any(|w| w == target)
+}
+
+fn channel_sweep_detect(iface: &str, target: &[u8; 6]) -> Option<u8> {
+    let candidates: &[u8] = &[1, 6, 11, 36, 40, 44, 48, 149, 153, 157, 161];
+    let mut best_ch = None;
+    let mut best_hits = 0u64;
+
+    for &ch in candidates {
+        if let Err(e) = set_channel_airport(iface, ch) {
+            log_debug(&format!("Channel {} set failed: {}", ch, e));
+            continue;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+
+        let mut local_hits = 0u64;
+        if let Ok(mut cap) = Capture::from_device(iface)
+            .and_then(|d| d.promisc(true).timeout(200).open())
+        {
+            for _ in 0..60 {
+                match cap.next_packet() {
+                    Ok(pkt) => {
+                        if packet_contains_mac(pkt.data, target) {
+                            local_hits += 1;
+                            if local_hits > best_hits {
+                                best_hits = local_hits;
+                                best_ch = Some(ch);
+                            }
+                        }
+                    }
+                    Err(pcap::Error::TimeoutExpired) => break,
+                    Err(_) => break,
+                }
+            }
+        }
+
+        log_debug(&format!("Channel {} sweep hits: {}", ch, local_hits));
+    }
+
+    best_ch
+}
+
+fn auto_select_channel(iface: &str, target: &[u8; 6]) -> Result<Option<u8>, String> {
+    let target_s = format_mac_bytes(target).to_lowercase();
+
+    // First try fast path: use airport scan to find BSSID exact match
+    if let Some(rows) = scan_airport_channels() {
+        for (bssid, ch) in &rows {
+            if bssid.to_lowercase() == target_s {
+                log_debug(&format!("airport -s matched target on channel {}", ch));
+                if let Err(e) = set_channel_airport(iface, *ch) {
+                    return Err(format!("failed to set channel {}: {}", ch, e));
+                }
+                return Ok(Some(*ch));
+            }
+        }
+    }
+
+    // Fallback: sweep candidate channels with short sniff windows
+    let sweep = channel_sweep_detect(iface, target);
+    if let Some(ch) = sweep {
+        if let Err(e) = set_channel_airport(iface, ch) {
+            return Err(format!("failed to set channel {}: {}", ch, e));
+        }
+        return Ok(Some(ch));
+    }
+
+    Ok(None)
+}
+
 impl Default for GuiApp {
     fn default() -> Self {
         let interfaces = Device::list()
@@ -71,6 +199,8 @@ impl Default for GuiApp {
             total_frames: 0,
             hits: 0,
             start_time: None,
+            auto_channel: None,
+            channel_note: None,
             rx: None,
             stop_flag: None,
             error: None,
@@ -233,12 +363,15 @@ impl eframe::App for GuiApp {
                     }
                     self.scanning = false;
                     self.stop_flag = None;
+                    self.channel_note = None;
                 } else {
                     // Start
                     self.error = None;
                     self.total_frames = 0;
                     self.hits = 0;
                     self.start_time = Some(Instant::now());
+                    self.auto_channel = None;
+                    self.channel_note = None;
 
                     let iface = match &self.selected_iface {
                         Some(i) => i.clone(),
@@ -261,6 +394,20 @@ impl eframe::App for GuiApp {
                             return;
                         }
                     };
+
+                    // Attempt auto channel selection
+                    match auto_select_channel(&iface, &mac_bytes) {
+                        Ok(Some(ch)) => {
+                            self.auto_channel = Some(ch);
+                            self.channel_note = Some(format!("Locked channel {} via auto-test", ch));
+                        }
+                        Ok(None) => {
+                            self.channel_note = Some("Auto channel: no signal detected; staying on current channel".into());
+                        }
+                        Err(e) => {
+                            self.channel_note = Some(format!("Auto channel failed: {e}"));
+                        }
+                    }
 
                     let (tx, rx) = mpsc::channel::<ScanUpdate>();
                     let stop_flag = Arc::new(AtomicBool::new(false));
@@ -288,6 +435,13 @@ impl eframe::App for GuiApp {
             ui.label(format!("Matches: {}", self.hits));
             ui.label(format!("Elapsed: {:.1} s", elapsed));
             ui.label(format!("Hit rate: {:.2} hits/s", hit_rate));
+
+            if let Some(ch) = self.auto_channel {
+                ui.label(format!("Channel: {} (auto)", ch));
+            }
+            if let Some(note) = &self.channel_note {
+                ui.small(note);
+            }
 
             ui.add_space(8.0);
             // RSSI / signal strength indicator (uses smoothed RSSI when available)
