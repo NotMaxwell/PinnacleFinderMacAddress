@@ -1,9 +1,10 @@
 use eframe::{egui, run_native, NativeOptions};
 use pcap::{Capture, Device};
 
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
+use std::fmt::Write as FmtWrite;
 
 #[derive(Clone, Debug)]
 struct ScanUpdate {
@@ -31,6 +32,25 @@ struct GuiApp {
     rx: Option<mpsc::Receiver<ScanUpdate>>,
     stop_flag: Option<Arc<AtomicBool>>,
     error: Option<String>,
+}
+
+static DEBUG_FLAG: OnceLock<bool> = OnceLock::new();
+
+fn debug_enabled() -> bool {
+    *DEBUG_FLAG.get_or_init(|| {
+        std::env::var("PF_DEBUG")
+            .map(|v| {
+                let v = v.trim();
+                v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn log_debug(msg: &str) {
+    if debug_enabled() {
+        println!("[DEBUG] {msg}");
+    }
 }
 
 impl Default for GuiApp {
@@ -329,18 +349,39 @@ fn parse_mac(s: &str) -> Option<[u8; 6]> {
 fn capture_loop(iface: String, mac: [u8; 6], tx: mpsc::Sender<ScanUpdate>, stop_flag: Arc<AtomicBool>) {
     let target = mac.to_vec();
 
+    let debug_on = debug_enabled();
+    if debug_on {
+        log_debug(&format!(
+            "Starting scan for MAC {} on interface {}",
+            format_mac_bytes(&mac),
+            iface
+        ));
+    }
+    
+    println!("\n[Capture] Starting scan for MAC: {}", format_mac_bytes(&mac));
+    println!("[Capture] Interface: {}", iface);
+
     let mut cap = match Capture::from_device(iface.as_str()).and_then(|d| d.promisc(true).timeout(1000).open()) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("[capture] Failed to open device: {e}");
+            eprintln!("[ERROR] Failed to open device: {}", e);
             return;
         }
     };
 
+    if debug_on {
+        log_debug("Device opened in promiscuous mode with 1000ms timeout");
+    }
+
     let mut total_frames: u64 = 0;
     let mut hits: u64 = 0;
     let mut last_rssi: Option<i8> = None;
-    let mut last_send = std::time::Instant::now();
+    let mut last_send = Instant::now();
+    let mut last_debug = Instant::now();
+    let mut parse_failures: u64 = 0;
+    let mut raw_matches: u64 = 0;
+    let mut timeouts: u64 = 0;
+    let scan_start = Instant::now();
 
     while !stop_flag.load(Ordering::Relaxed) {
         match cap.next_packet() {
@@ -352,72 +393,201 @@ fn capture_loop(iface: String, mac: [u8; 6], tx: mpsc::Sender<ScanUpdate>, stop_
                     if src.to_vec() == target {
                         hits += 1;
                         last_rssi = Some(rssi);
+                        
+                        // Print packet match to terminal
+                        let elapsed = scan_start.elapsed().as_secs_f32();
+                        println!(
+                            "[MATCH] Hit #{} - MAC: {} | RSSI: {} dBm | Elapsed: {:.2}s",
+                            hits,
+                            format_mac_bytes(&src),
+                            rssi,
+                            elapsed
+                        );
                     }
                 } else {
-                    // Fallback: if we can't parse, still try a raw match
+                    parse_failures += 1;
+                    // Fallback: if we can't parse radiotap, still try a raw match
                     if pkt.data.len() >= 6 {
                         if pkt.data.windows(6).any(|w| w == target.as_slice()) {
                             hits += 1;
+                            raw_matches += 1;
+                            let elapsed = scan_start.elapsed().as_secs_f32();
+                            println!(
+                                "[MATCH] Hit #{} - MAC: {} | RSSI: Not available | Elapsed: {:.2}s (parsed as raw match)",
+                                hits,
+                                format_mac_bytes(&mac),
+                                elapsed
+                            );
                         }
                     }
                 }
 
+                // Send update to UI every 100ms
                 if last_send.elapsed() >= std::time::Duration::from_millis(100) {
                     let _ = tx.send(ScanUpdate { total_frames, hits, last_rssi });
-                    last_send = std::time::Instant::now();
+                    last_send = Instant::now();
+                }
+
+                // Periodic debug heartbeat
+                if debug_on && last_debug.elapsed() >= std::time::Duration::from_secs(2) {
+                    let last_rssi_display = last_rssi
+                        .map(|r| r.to_string())
+                        .unwrap_or_else(|| "--".to_string());
+                    log_debug(&format!(
+                        "Frames: {total_frames}, Hits: {hits}, Parse misses: {parse_failures}, Raw matches: {raw_matches}, Timeouts: {timeouts}, Last RSSI: {last_rssi_display} dBm"
+                    ));
+                    last_debug = Instant::now();
                 }
             }
-            Err(_) => {
-                // timeout or transient error
+            Err(pcap::Error::TimeoutExpired) => {
+                timeouts += 1;
+                if debug_on && timeouts % 20 == 0 {
+                    log_debug("pcap timeout (no packet received in interval)");
+                }
+            }
+            Err(e) => {
+                eprintln!("[WARNING] Packet capture error: {}", e);
             }
         }
     }
 
+    // Send final update
     let _ = tx.send(ScanUpdate { total_frames, hits, last_rssi });
+    
+    println!(
+        "\n[Capture] Scan complete. Total frames: {}, Matches: {}",
+        total_frames, hits
+    );
+
+    if debug_on {
+        log_debug("Capture loop exited after stop flag set");
+    }
 }
 
 /// Parse Radiotap + 802.11 header.
 /// Returns (transmitter MAC, RSSI) if we can parse both.
 fn extract_80211_src_mac_and_rssi(data: &[u8]) -> Option<([u8; 6], i8)> {
-    if data.len() < 8 { return None; }
+    // Radiotap header minimum is 8 bytes
+    if data.len() < 8 {
+        return None;
+    }
+
+    // Check radiotap header version (should be 0)
+    if data[0] != 0 {
+        return None;
+    }
+
     let radiotap_len = u16::from_le_bytes([data[2], data[3]]) as usize;
-    if radiotap_len > data.len() { return None; }
+    
+    // Validate radiotap length is reasonable
+    if radiotap_len < 8 || radiotap_len > data.len() {
+        return None;
+    }
+
     let present = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-    if (present & (1 << 31)) != 0 { return None; }
+    
+    // Skip if extended bitmap is present (bit 31)
+    if (present & (1 << 31)) != 0 {
+        return None;
+    }
 
     let mut offset = 8_usize;
     let mut rssi_opt: Option<i8> = None;
 
-    for field in 0..32 {
-        if (present & (1 << field)) == 0 { continue; }
+    // Parse radiotap fields according to IEEE 802.11-2020 radiotap specification
+    for field in 0..31 {
+        if (present & (1 << field)) == 0 {
+            continue;
+        }
+
+        // Field sizes and alignments according to radiotap spec
         let (size, align) = match field {
-            0 => (8, 8), 1 => (1,1), 2 => (1,1), 3 => (4,2), 4 => (2,1),
-            5 => (1,1), 6 => (1,1), 7 => (2,2), 8 => (2,2), 9 => (2,2),
-            10 => (1,1), 11 => (1,1), 12 => (1,1), 13 => (1,1),
-            _ => { return None; }
+            0 => (8, 8),   // TSFT: u64 timestamp
+            1 => (1, 1),   // Flags: u8
+            2 => (1, 1),   // Rate: u8 (500 kbps units)
+            3 => (4, 2),   // Channel: u16 frequency, u16 flags
+            4 => (2, 2),   // FHSS: u8 hop set, u8 hop pattern
+            5 => (1, 1),   // Antenna signal (RSSI): i8 or u8 in dBm
+            6 => (1, 1),   // Antenna noise: i8 in dBm
+            7 => (2, 2),   // Lock quality: u16
+            8 => (2, 2),   // TX power: u16
+            9 => (1, 1),   // Antenna: u8
+            10 => (1, 1),  // DB antenna signal: u8 in dBm
+            11 => (1, 1),  // DB antenna noise: u8 in dBm
+            12 => (2, 2),  // RX flags: u16
+            13 => (2, 2),  // TX flags: u16
+            14 => (1, 1),  // RTS retries: u8
+            15 => (1, 1),  // Data retries: u8
+            _ => {
+                // Unknown field, skip it - but we can't determine its size
+                // so we must return None to be safe
+                return None;
+            }
         };
 
-        let aligned = if align > 1 { (offset + (align - 1)) & !(align - 1) } else { offset };
-        if aligned + size > radiotap_len || aligned + size > data.len() { return None; }
+        // Apply alignment padding
+        let aligned = if align > 1 {
+            (offset + (align - 1)) & !(align - 1)
+        } else {
+            offset
+        };
+
+        // Bounds check
+        if aligned + size > radiotap_len || aligned + size > data.len() {
+            return None;
+        }
+
+        // Extract RSSI from field 5 (antenna signal)
         if field == 5 {
+            // RSSI is typically signed, convert to i8
             rssi_opt = Some(data[aligned] as i8);
         }
+
         offset = aligned + size;
     }
 
+    // RSSI is required for a valid match
     let rssi = rssi_opt?;
+
+    // Now parse the 802.11 frame header
     let hdr = &data[radiotap_len..];
-    if hdr.len() < 24 { return None; }
+    
+    // Minimum 802.11 frame: 24 bytes (basic header without QoS/HT)
+    if hdr.len() < 24 {
+        return None;
+    }
+
     let frame_control = u16::from_le_bytes([hdr[0], hdr[1]]);
     let frame_type = (frame_control >> 2) & 0x3;
-    if frame_type == 1 { return None; }
-    let mut src = [0u8;6];
+    
+    // Frame type 1 = Control frame (not what we want for source MAC extraction)
+    // We want management (0) or data (2) frames
+    if frame_type == 1 {
+        return None;
+    }
+
+    // Extract source MAC from address field 2 (bytes 10-15)
+    // For management and data frames, this is typically the transmitter
+    let mut src = [0u8; 6];
     src.copy_from_slice(&hdr[10..16]);
+    
     Some((src, rssi))
 }
 
 
 // (legacy integer RSSI helper removed — f32-based helper `rssi_f32_to_strength` used)
+
+/// Format MAC bytes as a colon-separated hex string
+fn format_mac_bytes(mac: &[u8; 6]) -> String {
+    let mut result = String::new();
+    for (i, &byte) in mac.iter().enumerate() {
+        if i > 0 {
+            result.push(':');
+        }
+        let _ = write!(result, "{:02X}", byte);
+    }
+    result
+}
 
 fn rssi_f32_to_strength(rssi: f32) -> f32 {
     let min = -100.0_f32;
