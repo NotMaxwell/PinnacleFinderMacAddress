@@ -1,5 +1,5 @@
 use eframe::{egui, run_native, NativeOptions};
-use pcap::{Capture, Device};
+use pcap::{Active, Capture, Device};
 
 use std::sync::{mpsc, Arc, OnceLock};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -54,6 +54,29 @@ fn debug_enabled() -> bool {
 fn log_debug(msg: &str) {
     if debug_enabled() {
         println!("[DEBUG] {msg}");
+    }
+}
+
+fn open_capture(iface: &str, timeout_ms: i32) -> Result<Capture<Active>, String> {
+    // Try monitor mode first; fall back to promisc only if monitor fails
+    let try_rfmon = Capture::from_device(iface)
+        .map_err(|e| format!("from_device: {e}"))?
+        .rfmon(true)
+        .promisc(true)
+        .timeout(timeout_ms)
+        .open();
+
+    match try_rfmon {
+        Ok(c) => Ok(c),
+        Err(e1) => {
+            log_debug(&format!("rfmon open failed (will retry promisc): {e1}"));
+            Capture::from_device(iface)
+                .map_err(|e| format!("from_device: {e}"))?
+                .promisc(true)
+                .timeout(timeout_ms)
+                .open()
+                .map_err(|e2| format!("open: {e2}"))
+        }
     }
 }
 
@@ -124,15 +147,17 @@ fn channel_sweep_detect(iface: &str, target: &[u8; 6]) -> Option<u8> {
             log_debug(&format!("Channel {} set failed: {}", ch, e));
             continue;
         }
-        std::thread::sleep(Duration::from_millis(200));
+        // Allow the interface to settle on the new channel
+        std::thread::sleep(Duration::from_millis(250));
 
         let mut local_hits = 0u64;
-        if let Ok(mut cap) = Capture::from_device(iface)
-            .and_then(|d| d.promisc(true).timeout(200).open())
-        {
-            for _ in 0..60 {
+        if let Ok(mut cap) = open_capture(iface, 400) {
+            let mut packets = 0u32;
+            let sweep_deadline = Instant::now() + Duration::from_millis(450);
+            while packets < 200 && Instant::now() < sweep_deadline {
                 match cap.next_packet() {
                     Ok(pkt) => {
+                        packets += 1;
                         if packet_contains_mac(pkt.data, target) {
                             local_hits += 1;
                             if local_hits > best_hits {
@@ -158,6 +183,7 @@ fn auto_select_channel(iface: &str, target: &[u8; 6]) -> Result<Option<u8>, Stri
 
     // First try fast path: use airport scan to find BSSID exact match
     if let Some(rows) = scan_airport_channels() {
+        log_debug(&format!("airport -s found {} entries", rows.len()));
         for (bssid, ch) in &rows {
             if bssid.to_lowercase() == target_s {
                 log_debug(&format!("airport -s matched target on channel {}", ch));
@@ -515,7 +541,7 @@ fn capture_loop(iface: String, mac: [u8; 6], tx: mpsc::Sender<ScanUpdate>, stop_
     println!("\n[Capture] Starting scan for MAC: {}", format_mac_bytes(&mac));
     println!("[Capture] Interface: {}", iface);
 
-    let mut cap = match Capture::from_device(iface.as_str()).and_then(|d| d.promisc(true).timeout(1000).open()) {
+    let mut cap = match open_capture(&iface, 1000) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("[ERROR] Failed to open device: {}", e);
@@ -547,6 +573,14 @@ fn capture_loop(iface: String, mac: [u8; 6], tx: mpsc::Sender<ScanUpdate>, stop_
                 if let Some((src, rssi)) = extract_80211_src_mac_and_rssi(pkt.data) {
                     last_rssi = Some(rssi); // track latest RSSI even if not the target
                     last_seen_mac = Some(src);
+
+                    if debug_on {
+                        println!(
+                            "[SEEN] MAC: {} | RSSI: {} dBm",
+                            format_mac_bytes(&src),
+                            rssi
+                        );
+                    }
 
                     if src.to_vec() == target {
                         hits += 1;
