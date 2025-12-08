@@ -376,6 +376,7 @@ fn capture_loop(iface: String, mac: [u8; 6], tx: mpsc::Sender<ScanUpdate>, stop_
     let mut total_frames: u64 = 0;
     let mut hits: u64 = 0;
     let mut last_rssi: Option<i8> = None;
+    let mut last_seen_mac: Option<[u8; 6]> = None;
     let mut last_send = Instant::now();
     let mut last_debug = Instant::now();
     let mut parse_failures: u64 = 0;
@@ -390,9 +391,11 @@ fn capture_loop(iface: String, mac: [u8; 6], tx: mpsc::Sender<ScanUpdate>, stop_
 
                 // Try to parse 802.11 + radiotap to get src MAC and RSSI
                 if let Some((src, rssi)) = extract_80211_src_mac_and_rssi(pkt.data) {
+                    last_rssi = Some(rssi); // track latest RSSI even if not the target
+                    last_seen_mac = Some(src);
+
                     if src.to_vec() == target {
                         hits += 1;
-                        last_rssi = Some(rssi);
                         
                         // Print packet match to terminal
                         let elapsed = scan_start.elapsed().as_secs_f32();
@@ -433,8 +436,11 @@ fn capture_loop(iface: String, mac: [u8; 6], tx: mpsc::Sender<ScanUpdate>, stop_
                     let last_rssi_display = last_rssi
                         .map(|r| r.to_string())
                         .unwrap_or_else(|| "--".to_string());
+                    let last_seen_display = last_seen_mac
+                        .map(|m| format_mac_bytes(&m))
+                        .unwrap_or_else(|| "--".to_string());
                     log_debug(&format!(
-                        "Frames: {total_frames}, Hits: {hits}, Parse misses: {parse_failures}, Raw matches: {raw_matches}, Timeouts: {timeouts}, Last RSSI: {last_rssi_display} dBm"
+                        "Frames: {total_frames}, Hits: {hits}, Parse misses: {parse_failures}, Raw matches: {raw_matches}, Timeouts: {timeouts}, Last RSSI: {last_rssi_display} dBm, Last seen: {last_seen_display}"
                     ));
                     last_debug = Instant::now();
                 }
@@ -551,7 +557,7 @@ fn extract_80211_src_mac_and_rssi(data: &[u8]) -> Option<([u8; 6], i8)> {
 
     // Now parse the 802.11 frame header
     let hdr = &data[radiotap_len..];
-    
+
     // Minimum 802.11 frame: 24 bytes (basic header without QoS/HT)
     if hdr.len() < 24 {
         return None;
@@ -559,18 +565,39 @@ fn extract_80211_src_mac_and_rssi(data: &[u8]) -> Option<([u8; 6], i8)> {
 
     let frame_control = u16::from_le_bytes([hdr[0], hdr[1]]);
     let frame_type = (frame_control >> 2) & 0x3;
-    
+
     // Frame type 1 = Control frame (not what we want for source MAC extraction)
     // We want management (0) or data (2) frames
     if frame_type == 1 {
         return None;
     }
 
-    // Extract source MAC from address field 2 (bytes 10-15)
-    // For management and data frames, this is typically the transmitter
+    let to_ds = (frame_control & 0x0100) != 0;
+    let from_ds = (frame_control & 0x0200) != 0;
+
+    // Need address 4 when both DS bits are set
+    let min_len = if to_ds && from_ds { 30 } else { 24 };
+    if hdr.len() < min_len {
+        return None;
+    }
+
+    // Address layout per 802.11:
+    // addr1 @ 4..10, addr2 @ 10..16, addr3 @ 16..22, addr4 @ 24..30 (if present)
     let mut src = [0u8; 6];
-    src.copy_from_slice(&hdr[10..16]);
-    
+    if to_ds && from_ds {
+        // WDS frame: source is addr4
+        src.copy_from_slice(&hdr[24..30]);
+    } else if to_ds {
+        // To DS (STA -> AP): source is addr2
+        src.copy_from_slice(&hdr[10..16]);
+    } else if from_ds {
+        // From DS (AP -> STA): source is addr3
+        src.copy_from_slice(&hdr[16..22]);
+    } else {
+        // Ad-hoc / mgmt: source is addr2
+        src.copy_from_slice(&hdr[10..16]);
+    }
+
     Some((src, rssi))
 }
 
