@@ -25,6 +25,12 @@ struct GuiApp {
 
     smoothed_rssi: Option<f32>,
 
+    // Controls for auto channel selection and monitor-mode management
+    auto_channel_enabled: bool,
+    manage_monitor: bool,
+    // Whether this app enabled monitor mode and should attempt to restore
+    monitor_managed_by_app: bool,
+
     scanning: bool,
     total_frames: u64,
     hits: u64,
@@ -80,52 +86,187 @@ fn open_capture(iface: &str, timeout_ms: i32) -> Result<Capture<Active>, String>
     }
 }
 
-fn set_channel_airport(iface: &str, channel: u8) -> Result<(), String> {
-    let output = Command::new("/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport")
-        .arg(iface)
-        .arg("--channel")
-        .arg(channel.to_string())
-        .output()
-        .map_err(|e| format!("failed to run airport: {e}"))?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "airport returned status {} with stderr: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    Ok(())
+/// Check whether a program exists in PATH
+fn command_exists(cmd: &str) -> bool {
+    which::which(cmd).is_ok()
 }
 
-fn scan_airport_channels() -> Option<Vec<(String, u8)>> {
-    let output = Command::new("/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport")
-        .arg("-s")
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
+/// Set wireless channel using platform-appropriate tools.
+fn set_channel_system(iface: &str, channel: u8) -> Result<(), String> {
+    // Prefer `airport` on macOS if present
+    if cfg!(target_os = "macos") {
+        if let Ok(output) = Command::new("/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport")
+            .arg(iface)
+            .arg("--channel")
+            .arg(channel.to_string())
+            .output()
+        {
+            if !output.status.success() {
+                return Err(format!(
+                    "airport returned status {} with stderr: {}",
+                    output.status,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ));
+            }
+            return Ok(());
+        }
     }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut rows = Vec::new();
-    for line in stdout.lines().skip(1) {
-        // Try to find a BSSID token (xx:xx:xx:xx:xx:xx) and a channel number near it
-        let tokens: Vec<&str> = line.split_whitespace().collect();
-        let mut bssid_idx = None;
-        for (i, t) in tokens.iter().enumerate() {
-            if t.len() == 17 && t.matches(':').count() == 5 {
-                bssid_idx = Some(i);
-                break;
+
+    // On Linux prefer `iw` then fall back to `iwconfig`
+    if command_exists("iw") {
+        let output = Command::new("iw")
+            .arg("dev")
+            .arg(iface)
+            .arg("set")
+            .arg("channel")
+            .arg(channel.to_string())
+            .output()
+            .map_err(|e| format!("failed to run iw: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "iw returned status {} with stderr: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        return Ok(());
+    }
+
+    if command_exists("iwconfig") {
+        let output = Command::new("iwconfig")
+            .arg(iface)
+            .arg("channel")
+            .arg(channel.to_string())
+            .output()
+            .map_err(|e| format!("failed to run iwconfig: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "iwconfig returned status {} with stderr: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        return Ok(());
+    }
+
+    Err("no supported tool found to set channel (need `iw` or `iwconfig` on Linux, or `airport` on macOS)".into())
+}
+
+/// Scan for nearby APs and return (BSSID, channel) tuples using platform tools.
+fn scan_system_channels(iface: &str) -> Option<Vec<(String, u8)>> {
+    // macOS airport first
+    if cfg!(target_os = "macos") {
+        if let Ok(output) = Command::new("/System/Library/PrivateFrameworks/Apple80211.framework/Versions/Current/Resources/airport")
+            .arg("-s")
+            .output()
+        {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let mut rows = Vec::new();
+                for line in stdout.lines().skip(1) {
+                    let tokens: Vec<&str> = line.split_whitespace().collect();
+                    let mut bssid_idx = None;
+                    for (i, t) in tokens.iter().enumerate() {
+                        if t.len() == 17 && t.matches(':').count() == 5 {
+                            bssid_idx = Some(i);
+                            break;
+                        }
+                    }
+                    let Some(idx) = bssid_idx else { continue };
+                    if idx + 1 >= tokens.len() { continue; }
+                    let bssid = tokens[idx].to_string();
+                    if let Ok(ch) = tokens[idx + 1].parse::<u8>() {
+                        rows.push((bssid, ch));
+                    }
+                }
+                if rows.is_empty() { None } else { return Some(rows); }
             }
         }
-        let Some(idx) = bssid_idx else { continue };
-        if idx + 1 >= tokens.len() { continue; }
-        let bssid = tokens[idx].to_string();
-        if let Ok(ch) = tokens[idx + 1].parse::<u8>() {
-            rows.push((bssid, ch));
+    }
+
+    // Try `iw` on Linux (preferred)
+    if command_exists("iw") {
+        if let Ok(output) = Command::new("iw").arg("dev").arg(iface).arg("scan").output() {
+            if !output.status.success() {
+                // fall through to iwlist
+            } else {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let mut rows = Vec::new();
+                let mut cur_bssid: Option<String> = None;
+                for line in stdout.lines() {
+                    let trimmed = line.trim_start();
+                    if trimmed.starts_with("BSS ") {
+                        // Example: "BSS aa:bb:cc:dd:ee:ff(on wlan0)"
+                        let parts: Vec<&str> = trimmed.split_whitespace().collect();
+                        if parts.len() >= 2 {
+                            cur_bssid = Some(parts[1].trim().to_string());
+                        }
+                    }
+                    if let Some(bssid) = &cur_bssid {
+                        if trimmed.starts_with("freq:") {
+                            if let Some(freq_s) = trimmed.split_whitespace().nth(1) {
+                                if let Ok(freq) = freq_s.parse::<u32>() {
+                                    if let Some(ch) = freq_to_channel(freq) {
+                                        rows.push((bssid.clone(), ch));
+                                    }
+                                }
+                            }
+                            cur_bssid = None;
+                        }
+                    }
+                }
+                if !rows.is_empty() { return Some(rows); }
+            }
         }
     }
-    if rows.is_empty() { None } else { Some(rows) }
+
+    // Fallback to `iwlist <iface> scanning` which is available on many distros
+    if command_exists("iwlist") {
+        if let Ok(output) = Command::new("iwlist").arg(iface).arg("scanning").output() {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let mut rows = Vec::new();
+                let mut cur_bssid: Option<String> = None;
+                for line in stdout.lines() {
+                    let t = line.trim();
+                    if t.starts_with("Cell ") && t.contains("Address:") {
+                        // Example: Cell 01 - Address: aa:bb:cc:dd:ee:ff
+                        if let Some(idx) = t.find("Address:") {
+                            let b = t[idx + 8..].trim();
+                            cur_bssid = Some(b.to_string());
+                        }
+                    }
+                    if let Some(bssid) = &cur_bssid {
+                        if t.starts_with("Channel:") {
+                            if let Some(chs) = t.split(':').nth(1) {
+                                if let Ok(ch) = chs.trim().parse::<u8>() {
+                                    rows.push((bssid.clone(), ch));
+                                }
+                            }
+                            cur_bssid = None;
+                        }
+                    }
+                }
+                if rows.is_empty() { None } else { return Some(rows); }
+            }
+        }
+    }
+
+    None
+}
+
+fn freq_to_channel(freq: u32) -> Option<u8> {
+    // 2.4 GHz: channel = (freq - 2407) / 5
+    if freq >= 2412 && freq <= 2484 {
+        let ch = ((freq as i32 - 2407) / 5) as u8;
+        return Some(ch);
+    }
+    // 5 GHz common mapping: channel = (freq - 5000) / 5
+    if freq >= 5000 && freq <= 6000 {
+        let ch = ((freq as i32 - 5000) / 5) as u8;
+        return Some(ch);
+    }
+    None
 }
 
 fn packet_contains_mac(data: &[u8], target: &[u8; 6]) -> bool {
@@ -137,13 +278,115 @@ fn packet_contains_mac(data: &[u8], target: &[u8; 6]) -> bool {
     data.windows(6).any(|w| w == target)
 }
 
+/// Enable monitor mode on the provided interface (Linux only).
+fn enable_monitor_mode(iface: &str) -> Result<(), String> {
+    if cfg!(target_os = "linux") {
+        if !command_exists("ip") || !command_exists("iw") {
+            return Err("`ip` or `iw` not found; cannot enable monitor mode".into());
+        }
+        // ip link set <iface> down
+        let s = Command::new("ip")
+            .arg("link")
+            .arg("set")
+            .arg(iface)
+            .arg("down")
+            .status()
+            .map_err(|e| format!("failed to run ip down: {}", e))?;
+        if !s.success() {
+            return Err(format!("ip down returned status {}", s));
+        }
+
+        // iw dev <iface> set type monitor
+        let s = Command::new("iw")
+            .arg("dev")
+            .arg(iface)
+            .arg("set")
+            .arg("type")
+            .arg("monitor")
+            .status()
+            .map_err(|e| format!("failed to run iw set type monitor: {}", e))?;
+        if !s.success() {
+            return Err(format!("iw set type returned status {}", s));
+        }
+
+        // ip link set <iface> up
+        let s = Command::new("ip")
+            .arg("link")
+            .arg("set")
+            .arg(iface)
+            .arg("up")
+            .status()
+            .map_err(|e| format!("failed to run ip up: {}", e))?;
+        if !s.success() {
+            return Err(format!("ip up returned status {}", s));
+        }
+
+        Ok(())
+    } else if cfg!(target_os = "macos") {
+        Err("automatic monitor-mode management is not implemented on macOS".into())
+    } else {
+        Err("monitor-mode management not supported on this OS".into())
+    }
+}
+
+/// Disable monitor mode (restore managed mode) on the provided interface (Linux only).
+fn disable_monitor_mode(iface: &str) -> Result<(), String> {
+    if cfg!(target_os = "linux") {
+        if !command_exists("ip") || !command_exists("iw") {
+            return Err("`ip` or `iw` not found; cannot disable monitor mode".into());
+        }
+        // ip link set <iface> down
+        let s = Command::new("ip")
+            .arg("link")
+            .arg("set")
+            .arg(iface)
+            .arg("down")
+            .status()
+            .map_err(|e| format!("failed to run ip down: {}", e))?;
+        if !s.success() {
+            return Err(format!("ip down returned status {}", s));
+        }
+
+        // iw dev <iface> set type managed
+        let s = Command::new("iw")
+            .arg("dev")
+            .arg(iface)
+            .arg("set")
+            .arg("type")
+            .arg("managed")
+            .status()
+            .map_err(|e| format!("failed to run iw set type managed: {}", e))?;
+        if !s.success() {
+            return Err(format!("iw set type returned status {}", s));
+        }
+
+        // ip link set <iface> up
+        let s = Command::new("ip")
+            .arg("link")
+            .arg("set")
+            .arg(iface)
+            .arg("up")
+            .status()
+            .map_err(|e| format!("failed to run ip up: {}", e))?;
+        if !s.success() {
+            return Err(format!("ip up returned status {}", s));
+        }
+
+        Ok(())
+    } else if cfg!(target_os = "macos") {
+        Err("automatic monitor-mode management is not implemented on macOS".into())
+    } else {
+        Err("monitor-mode management not supported on this OS".into())
+    }
+}
+
 fn channel_sweep_detect(iface: &str, target: &[u8; 6]) -> Option<u8> {
     let candidates: &[u8] = &[1, 6, 11, 36, 40, 44, 48, 149, 153, 157, 161];
     let mut best_ch = None;
     let mut best_hits = 0u64;
 
     for &ch in candidates {
-        if let Err(e) = set_channel_airport(iface, ch) {
+        if let Err(e) = set_channel_system(iface, ch) {
             log_debug(&format!("Channel {} set failed: {}", ch, e));
             continue;
         }
@@ -182,12 +425,12 @@ fn auto_select_channel(iface: &str, target: &[u8; 6]) -> Result<Option<u8>, Stri
     let target_s = format_mac_bytes(target).to_lowercase();
 
     // First try fast path: use airport scan to find BSSID exact match
-    if let Some(rows) = scan_airport_channels() {
+    if let Some(rows) = scan_system_channels(iface) {
         log_debug(&format!("airport -s found {} entries", rows.len()));
         for (bssid, ch) in &rows {
             if bssid.to_lowercase() == target_s {
                 log_debug(&format!("airport -s matched target on channel {}", ch));
-                if let Err(e) = set_channel_airport(iface, *ch) {
+                if let Err(e) = set_channel_system(iface, *ch) {
                     return Err(format!("failed to set channel {}: {}", ch, e));
                 }
                 return Ok(Some(*ch));
@@ -221,6 +464,9 @@ impl Default for GuiApp {
             show_iface_list: false,
             mac_input: String::new(),
             mac_valid: false,
+            auto_channel_enabled: true,
+            manage_monitor: false,
+            monitor_managed_by_app: false,
             scanning: false,
             total_frames: 0,
             hits: 0,
@@ -319,6 +565,13 @@ impl eframe::App for GuiApp {
                 });
             }
 
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.checkbox(&mut self.auto_channel_enabled, "Auto channel select");
+                ui.add_space(8.0);
+                ui.checkbox(&mut self.manage_monitor, "Manage monitor mode");
+            });
+
             ui.add_space(8.0);
 
             ui.label("Target MAC address (AA:BB:CC:DD:EE:FF)");
@@ -389,6 +642,20 @@ impl eframe::App for GuiApp {
                     }
                     self.scanning = false;
                     self.stop_flag = None;
+                    // If we enabled monitor mode, attempt to restore managed mode
+                    if self.monitor_managed_by_app {
+                        if let Some(iface_name) = &self.selected_iface {
+                            match disable_monitor_mode(iface_name) {
+                                Ok(()) => {
+                                    self.channel_note = Some("Monitor mode disabled; interface restored".into());
+                                }
+                                Err(e) => {
+                                    self.channel_note = Some(format!("Monitor disable failed: {}", e));
+                                }
+                            }
+                        }
+                        self.monitor_managed_by_app = false;
+                    }
                     self.channel_note = None;
                 } else {
                     // Start
@@ -421,17 +688,39 @@ impl eframe::App for GuiApp {
                         }
                     };
 
-                    // Attempt auto channel selection
-                    match auto_select_channel(&iface, &mac_bytes) {
-                        Ok(Some(ch)) => {
-                            self.auto_channel = Some(ch);
-                            self.channel_note = Some(format!("Locked channel {} via auto-test", ch));
+                    // Attempt auto channel selection (if enabled)
+                    if self.auto_channel_enabled {
+                        match auto_select_channel(&iface, &mac_bytes) {
+                            Ok(Some(ch)) => {
+                                self.auto_channel = Some(ch);
+                                self.channel_note = Some(format!("Locked channel {} via auto-test", ch));
+                            }
+                            Ok(None) => {
+                                self.channel_note = Some("Auto channel: no signal detected; staying on current channel".into());
+                            }
+                            Err(e) => {
+                                self.channel_note = Some(format!("Auto channel failed: {e}"));
+                            }
                         }
-                        Ok(None) => {
-                            self.channel_note = Some("Auto channel: no signal detected; staying on current channel".into());
-                        }
-                        Err(e) => {
-                            self.channel_note = Some(format!("Auto channel failed: {e}"));
+                    } else {
+                        self.channel_note = Some("Auto channel selection disabled".into());
+                    }
+
+                    // If requested, attempt to enable monitor mode before launching capture
+                    if self.manage_monitor {
+                        match enable_monitor_mode(&iface) {
+                            Ok(()) => {
+                                self.monitor_managed_by_app = true;
+                                // inform the user
+                                self.channel_note = Some(match &self.channel_note {
+                                    Some(n) => format!("{}; monitor mode enabled", n),
+                                    None => "monitor mode enabled".into(),
+                                });
+                            }
+                            Err(e) => {
+                                self.error = Some(format!("Failed to enable monitor mode: {}", e));
+                                return;
+                            }
                         }
                     }
 

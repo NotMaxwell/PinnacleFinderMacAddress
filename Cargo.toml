@@ -7,3 +7,4 @@ default-run = "PinnacleFinderMacAddress"
 [dependencies]
 pcap = "2.3.0"
 eframe = "0.33.2"
+which = "4.4.0"
