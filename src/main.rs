@@ -179,7 +179,7 @@ fn scan_system_channels(iface: &str) -> Option<Vec<(String, u8)>> {
                         rows.push((bssid, ch));
                     }
                 }
-                if rows.is_empty() { None } else { return Some(rows); }
+                if !rows.is_empty() { return Some(rows); }
             }
         }
     }
@@ -247,7 +247,7 @@ fn scan_system_channels(iface: &str) -> Option<Vec<(String, u8)>> {
                         }
                     }
                 }
-                if rows.is_empty() { None } else { return Some(rows); }
+                if !rows.is_empty() { return Some(rows); }
             }
         }
     }
@@ -441,7 +441,7 @@ fn auto_select_channel(iface: &str, target: &[u8; 6]) -> Result<Option<u8>, Stri
     // Fallback: sweep candidate channels with short sniff windows
     let sweep = channel_sweep_detect(iface, target);
     if let Some(ch) = sweep {
-        if let Err(e) = set_channel_airport(iface, ch) {
+        if let Err(e) = set_channel_system(iface, ch) {
             return Err(format!("failed to set channel {}: {}", ch, e));
         }
         return Ok(Some(ch));
