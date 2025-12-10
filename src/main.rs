@@ -860,21 +860,21 @@ fn capture_loop(iface: String, mac: [u8; 6], tx: mpsc::Sender<ScanUpdate>, stop_
 
                 // Try to parse 802.11 + radiotap to get src MAC and RSSI
                 if let Some((src, rssi)) = extract_80211_src_mac_and_rssi(pkt.data) {
-                    last_rssi = Some(rssi); // track latest RSSI even if not the target
                     last_seen_mac = Some(src);
 
-                    if debug_on {
-                        println!(
-                            "[SEEN] MAC: {} | RSSI: {} dBm",
-                            format_mac_bytes(&src),
-                            rssi
-                        );
-                    }
-
                     if src.to_vec() == target {
+                        // Only update RSSI when the target MAC is seen
+                        last_rssi = Some(rssi);
                         hits += 1;
-                        
-                        // Print packet match to terminal
+
+                        if debug_on {
+                            println!(
+                                "[MATCH] MAC: {} | RSSI: {} dBm",
+                                format_mac_bytes(&src),
+                                rssi
+                            );
+                        }
+
                         let elapsed = scan_start.elapsed().as_secs_f32();
                         println!(
                             "[MATCH] Hit #{} - MAC: {} | RSSI: {} dBm | Elapsed: {:.2}s",
@@ -882,6 +882,12 @@ fn capture_loop(iface: String, mac: [u8; 6], tx: mpsc::Sender<ScanUpdate>, stop_
                             format_mac_bytes(&src),
                             rssi,
                             elapsed
+                        );
+                    } else if debug_on {
+                        println!(
+                            "[SEEN non-target] MAC: {} | RSSI: {} dBm",
+                            format_mac_bytes(&src),
+                            rssi
                         );
                     }
                 } else {
