@@ -1,11 +1,12 @@
-use eframe::{egui, run_native, NativeOptions};
+use eframe::{NativeOptions, egui, run_native};
 use pcap::{Active, Capture, Device};
 
-use std::sync::{mpsc, Arc, OnceLock};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::collections::HashMap;
 use std::fmt::Write as FmtWrite;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, mpsc};
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
 struct ScanUpdate {
@@ -45,6 +46,7 @@ struct GuiApp {
 }
 
 static DEBUG_FLAG: OnceLock<bool> = OnceLock::new();
+static COMMAND_CHECK_CACHE: OnceLock<Mutex<HashMap<String, bool>>> = OnceLock::new();
 
 fn debug_enabled() -> bool {
     *DEBUG_FLAG.get_or_init(|| {
@@ -66,7 +68,7 @@ fn log_debug(msg: &str) {
 fn open_capture(iface: &str, timeout_ms: i32) -> Result<Capture<Active>, String> {
     // Try monitor mode first; fall back to promisc only if monitor fails
     let try_rfmon = Capture::from_device(iface)
-        .map_err(|e| format!("from_device: {e}"))?
+        .map_err(|e| format!("from_device({iface}): {e}"))?
         .rfmon(true)
         .promisc(true)
         .timeout(timeout_ms)
@@ -75,20 +77,34 @@ fn open_capture(iface: &str, timeout_ms: i32) -> Result<Capture<Active>, String>
     match try_rfmon {
         Ok(c) => Ok(c),
         Err(e1) => {
-            log_debug(&format!("rfmon open failed (will retry promisc): {e1}"));
+            log_debug(&format!(
+                "rfmon open failed on {iface} (will retry promisc): {e1}"
+            ));
             Capture::from_device(iface)
-                .map_err(|e| format!("from_device: {e}"))?
+                .map_err(|e| format!("from_device({iface}): {e}"))?
                 .promisc(true)
                 .timeout(timeout_ms)
                 .open()
-                .map_err(|e2| format!("open: {e2}"))
+                .map_err(|e2| format!("open({iface}) promisc failed; rfmon error was {e1}: {e2}"))
         }
     }
 }
 
 /// Check whether a program exists in PATH
 fn command_exists(cmd: &str) -> bool {
-    which::which(cmd).is_ok()
+    let cache = COMMAND_CHECK_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+
+    if let Ok(mut map) = cache.lock() {
+        if let Some(&cached) = map.get(cmd) {
+            return cached;
+        }
+        let found = which::which(cmd).is_ok();
+        map.insert(cmd.to_string(), found);
+        found
+    } else {
+        // Fallback without caching if the mutex is poisoned
+        which::which(cmd).is_ok()
+    }
 }
 
 /// Set wireless channel using platform-appropriate tools.
@@ -186,7 +202,12 @@ fn scan_system_channels(iface: &str) -> Option<Vec<(String, u8)>> {
 
     // Try `iw` on Linux (preferred)
     if command_exists("iw") {
-        if let Ok(output) = Command::new("iw").arg("dev").arg(iface).arg("scan").output() {
+        if let Ok(output) = Command::new("iw")
+            .arg("dev")
+            .arg(iface)
+            .arg("scan")
+            .output()
+        {
             if !output.status.success() {
                 // fall through to iwlist
             } else {
@@ -215,7 +236,9 @@ fn scan_system_channels(iface: &str) -> Option<Vec<(String, u8)>> {
                         }
                     }
                 }
-                if !rows.is_empty() { return Some(rows); }
+                if !rows.is_empty() {
+                    return Some(rows);
+                }
             }
         }
     }
@@ -247,7 +270,9 @@ fn scan_system_channels(iface: &str) -> Option<Vec<(String, u8)>> {
                         }
                     }
                 }
-                if !rows.is_empty() { return Some(rows); }
+                if !rows.is_empty() {
+                    return Some(rows);
+                }
             }
         }
     }
@@ -484,6 +509,8 @@ impl Default for GuiApp {
 
 impl eframe::App for GuiApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let monitor_supported = cfg!(target_os = "linux");
+
         // Poll updates from capture thread
         if let Some(rx) = &self.rx {
             let mut got = false;
@@ -569,24 +596,31 @@ impl eframe::App for GuiApp {
             ui.horizontal(|ui| {
                 ui.checkbox(&mut self.auto_channel_enabled, "Auto channel select");
                 ui.add_space(8.0);
-                ui.checkbox(&mut self.manage_monitor, "Manage monitor mode");
+                let mut manage_monitor = self.manage_monitor;
+                let resp = ui.add_enabled(
+                    monitor_supported,
+                    egui::Checkbox::new(&mut manage_monitor, "Manage monitor mode"),
+                );
+                if resp.changed() {
+                    self.manage_monitor = manage_monitor;
+                }
+                if !monitor_supported {
+                    ui.label(egui::RichText::new("(macOS: manual monitor mode)").small());
+                }
             });
 
             ui.add_space(8.0);
 
             ui.label("Target MAC address (AA:BB:CC:DD:EE:FF)");
             // Single input box for the full MAC address (legacy behavior)
-            let resp = ui.add(egui::TextEdit::singleline(&mut self.mac_input).desired_width(340.0));
-            if resp.changed() {
-                self.mac_input = format_mac_from_raw(&self.mac_input);
-            }
+            let _resp = ui.add(egui::TextEdit::singleline(&mut self.mac_input).desired_width(340.0));
 
             ui.add_space(6.0);
             // Always-visible on-screen hex keyboard for touchscreen users
             ui.label("On-screen keyboard:");
             ui.add_space(4.0);
             let keys_rows: &[&[&str]] = &[
-                &["1","2","3","4","5","6","7","8","9","0"],
+                &["1","2","3","4","5","6","7","8","9","0",":"],
                 &["A","B","C","D","E","F","<-","Clr"],
             ];
 
@@ -597,25 +631,32 @@ impl eframe::App for GuiApp {
                         if ui.add_sized(egui::Vec2::new(64.0, 64.0), btn).clicked() {
                             match k {
                                 "<-" => {
-                                    // remove last hex digit (ignore colons)
-                                    let raw = self.mac_input.chars().filter(|c| c.is_ascii_hexdigit()).collect::<String>();
-                                    if raw.is_empty() {
-                                        self.mac_input.clear();
-                                    } else {
-                                        let mut new_raw = raw;
-                                        new_raw.pop();
-                                        self.mac_input = format_mac_from_raw(&new_raw);
-                                    }
+                                    let mut raw = self
+                                        .mac_input
+                                        .chars()
+                                        .filter(|c| c.is_ascii_hexdigit())
+                                        .collect::<String>();
+                                    raw.pop();
+                                    self.mac_input = format_mac_from_hex(&raw);
                                 }
                                 "Clr" => {
                                     self.mac_input.clear();
                                 }
                                 ch => {
-                                    // append hex char if under 12 hex digits
-                                    let mut raw = self.mac_input.chars().filter(|c| c.is_ascii_hexdigit()).collect::<String>();
-                                    if raw.len() < 12 {
-                                        raw.push_str(ch);
-                                        self.mac_input = format_mac_from_raw(&raw);
+                                    if ch.len() == 1 {
+                                        let ch_char = ch.chars().next().unwrap();
+                                        // Only auto-format when a hex digit is pressed; ':' is ignored because formatting adds separators
+                                        if ch_char.is_ascii_hexdigit() {
+                                            let mut raw = self
+                                                .mac_input
+                                                .chars()
+                                                .filter(|c| c.is_ascii_hexdigit())
+                                                .collect::<String>();
+                                            if raw.len() < 12 {
+                                                raw.push(ch_char);
+                                                self.mac_input = format_mac_from_hex(&raw);
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -708,19 +749,23 @@ impl eframe::App for GuiApp {
 
                     // If requested, attempt to enable monitor mode before launching capture
                     if self.manage_monitor {
-                        match enable_monitor_mode(&iface) {
-                            Ok(()) => {
-                                self.monitor_managed_by_app = true;
-                                // inform the user
-                                self.channel_note = Some(match &self.channel_note {
-                                    Some(n) => format!("{}; monitor mode enabled", n),
-                                    None => "monitor mode enabled".into(),
-                                });
+                        if monitor_supported {
+                            match enable_monitor_mode(&iface) {
+                                Ok(()) => {
+                                    self.monitor_managed_by_app = true;
+                                    // inform the user
+                                    self.channel_note = Some(match &self.channel_note {
+                                        Some(n) => format!("{}; monitor mode enabled", n),
+                                        None => "monitor mode enabled".into(),
+                                    });
+                                }
+                                Err(e) => {
+                                    self.error = Some(format!("Failed to enable monitor mode: {}", e));
+                                    return;
+                                }
                             }
-                            Err(e) => {
-                                self.error = Some(format!("Failed to enable monitor mode: {}", e));
-                                return;
-                            }
+                        } else {
+                            self.channel_note = Some("Monitor mode management not available on this OS".into());
                         }
                     }
 
@@ -815,22 +860,28 @@ fn parse_mac(s: &str) -> Option<[u8; 6]> {
     Some(bytes)
 }
 
-fn capture_loop(iface: String, mac: [u8; 6], tx: mpsc::Sender<ScanUpdate>, stop_flag: Arc<AtomicBool>) {
-    let target = mac.to_vec();
+fn capture_loop(
+    iface: String,
+    mac: [u8; 6],
+    tx: mpsc::Sender<ScanUpdate>,
+    stop_flag: Arc<AtomicBool>,
+) {
+    let target = mac;
+    let target_slice: &[u8] = &target;
+    let target_str = format_mac_bytes(&target);
 
     let debug_on = debug_enabled();
     if debug_on {
         log_debug(&format!(
             "Starting scan for MAC {} on interface {}",
-            format_mac_bytes(&mac),
-            iface
+            target_str, iface
         ));
     }
-    
-    println!("\n[Capture] Starting scan for MAC: {}", format_mac_bytes(&mac));
+
+    println!("\n[Capture] Starting scan for MAC: {}", target_str);
     println!("[Capture] Interface: {}", iface);
 
-    let mut cap = match open_capture(&iface, 1000) {
+    let mut cap = match open_capture(&iface, 300) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("[ERROR] Failed to open device: {}", e);
@@ -862,26 +913,19 @@ fn capture_loop(iface: String, mac: [u8; 6], tx: mpsc::Sender<ScanUpdate>, stop_
                 if let Some((src, rssi)) = extract_80211_src_mac_and_rssi(pkt.data) {
                     last_seen_mac = Some(src);
 
-                    if src.to_vec() == target {
+                    if src == target {
                         // Only update RSSI when the target MAC is seen
                         last_rssi = Some(rssi);
                         hits += 1;
 
                         if debug_on {
-                            println!(
-                                "[MATCH] MAC: {} | RSSI: {} dBm",
-                                format_mac_bytes(&src),
-                                rssi
-                            );
+                            println!("[MATCH] MAC: {} | RSSI: {} dBm", target_str, rssi);
                         }
 
                         let elapsed = scan_start.elapsed().as_secs_f32();
                         println!(
                             "[MATCH] Hit #{} - MAC: {} | RSSI: {} dBm | Elapsed: {:.2}s",
-                            hits,
-                            format_mac_bytes(&src),
-                            rssi,
-                            elapsed
+                            hits, target_str, rssi, elapsed
                         );
                     } else if debug_on {
                         println!(
@@ -894,15 +938,13 @@ fn capture_loop(iface: String, mac: [u8; 6], tx: mpsc::Sender<ScanUpdate>, stop_
                     parse_failures += 1;
                     // Fallback: if we can't parse radiotap, still try a raw match
                     if pkt.data.len() >= 6 {
-                        if pkt.data.windows(6).any(|w| w == target.as_slice()) {
+                        if pkt.data.windows(6).any(|w| w == target_slice) {
                             hits += 1;
                             raw_matches += 1;
                             let elapsed = scan_start.elapsed().as_secs_f32();
                             println!(
                                 "[MATCH] Hit #{} - MAC: {} | RSSI: Not available | Elapsed: {:.2}s (parsed as raw match)",
-                                hits,
-                                format_mac_bytes(&mac),
-                                elapsed
+                                hits, target_str, elapsed
                             );
                         }
                     }
@@ -910,7 +952,11 @@ fn capture_loop(iface: String, mac: [u8; 6], tx: mpsc::Sender<ScanUpdate>, stop_
 
                 // Send update to UI every 100ms
                 if last_send.elapsed() >= std::time::Duration::from_millis(100) {
-                    let _ = tx.send(ScanUpdate { total_frames, hits, last_rssi });
+                    let _ = tx.send(ScanUpdate {
+                        total_frames,
+                        hits,
+                        last_rssi,
+                    });
                     last_send = Instant::now();
                 }
 
@@ -930,6 +976,8 @@ fn capture_loop(iface: String, mac: [u8; 6], tx: mpsc::Sender<ScanUpdate>, stop_
             }
             Err(pcap::Error::TimeoutExpired) => {
                 timeouts += 1;
+                // Light backoff to avoid spinning CPU when idle
+                std::thread::sleep(Duration::from_millis(5));
                 if debug_on && timeouts % 20 == 0 {
                     log_debug("pcap timeout (no packet received in interval)");
                 }
@@ -941,8 +989,12 @@ fn capture_loop(iface: String, mac: [u8; 6], tx: mpsc::Sender<ScanUpdate>, stop_
     }
 
     // Send final update
-    let _ = tx.send(ScanUpdate { total_frames, hits, last_rssi });
-    
+    let _ = tx.send(ScanUpdate {
+        total_frames,
+        hits,
+        last_rssi,
+    });
+
     println!(
         "\n[Capture] Scan complete. Total frames: {}, Matches: {}",
         total_frames, hits
@@ -967,72 +1019,88 @@ fn extract_80211_src_mac_and_rssi(data: &[u8]) -> Option<([u8; 6], i8)> {
     }
 
     let radiotap_len = u16::from_le_bytes([data[2], data[3]]) as usize;
-    
+
     // Validate radiotap length is reasonable
     if radiotap_len < 8 || radiotap_len > data.len() {
         return None;
     }
 
-    let present = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
-    
-    // Skip if extended bitmap is present (bit 31)
-    if (present & (1 << 31)) != 0 {
-        return None;
+    // Collect present bitmaps (handles extended maps)
+    let mut present_maps: Vec<u32> = Vec::new();
+    let mut present_offset = 4usize; // first bitmap starts at byte 4
+    loop {
+        if present_offset + 4 > data.len() {
+            return None;
+        }
+        let word = u32::from_le_bytes([
+            data[present_offset],
+            data[present_offset + 1],
+            data[present_offset + 2],
+            data[present_offset + 3],
+        ]);
+        present_maps.push(word);
+        present_offset += 4;
+        if (word & (1 << 31)) == 0 {
+            break;
+        }
     }
 
-    let mut offset = 8_usize;
+    let mut offset = present_offset;
     let mut rssi_opt: Option<i8> = None;
 
     // Parse radiotap fields according to IEEE 802.11-2020 radiotap specification
-    for field in 0..31 {
-        if (present & (1 << field)) == 0 {
-            continue;
-        }
+    for (map_idx, present) in present_maps.iter().enumerate() {
+        for bit in 0..32 {
+            if (present & (1 << bit)) == 0 {
+                continue;
+            }
 
-        // Field sizes and alignments according to radiotap spec
-        let (size, align) = match field {
-            0 => (8, 8),   // TSFT: u64 timestamp
-            1 => (1, 1),   // Flags: u8
-            2 => (1, 1),   // Rate: u8 (500 kbps units)
-            3 => (4, 2),   // Channel: u16 frequency, u16 flags
-            4 => (2, 2),   // FHSS: u8 hop set, u8 hop pattern
-            5 => (1, 1),   // Antenna signal (RSSI): i8 or u8 in dBm
-            6 => (1, 1),   // Antenna noise: i8 in dBm
-            7 => (2, 2),   // Lock quality: u16
-            8 => (2, 2),   // TX power: u16
-            9 => (1, 1),   // Antenna: u8
-            10 => (1, 1),  // DB antenna signal: u8 in dBm
-            11 => (1, 1),  // DB antenna noise: u8 in dBm
-            12 => (2, 2),  // RX flags: u16
-            13 => (2, 2),  // TX flags: u16
-            14 => (1, 1),  // RTS retries: u8
-            15 => (1, 1),  // Data retries: u8
-            _ => {
-                // Unknown field, skip it - but we can't determine its size
-                // so we must return None to be safe
+            let field_index = map_idx * 32 + bit as usize;
+
+            // Field sizes and alignments according to radiotap spec
+            let (size, align) = match field_index {
+                0 => (8, 8),  // TSFT: u64 timestamp
+                1 => (1, 1),  // Flags: u8
+                2 => (1, 1),  // Rate: u8 (500 kbps units)
+                3 => (4, 2),  // Channel: u16 frequency, u16 flags
+                4 => (2, 2),  // FHSS: u8 hop set, u8 hop pattern
+                5 => (1, 1),  // Antenna signal (RSSI): i8 or u8 in dBm
+                6 => (1, 1),  // Antenna noise: i8 in dBm
+                7 => (2, 2),  // Lock quality: u16
+                8 => (2, 2),  // TX power: u16
+                9 => (1, 1),  // Antenna: u8
+                10 => (1, 1), // DB antenna signal: u8 in dBm
+                11 => (1, 1), // DB antenna noise: u8 in dBm
+                12 => (2, 2), // RX flags: u16
+                13 => (2, 2), // TX flags: u16
+                14 => (1, 1), // RTS retries: u8
+                15 => (1, 1), // Data retries: u8
+                // Unknown or unsupported fields: skip without failing; they appear after the ones we need
+                _ => {
+                    continue;
+                }
+            };
+
+            // Apply alignment padding
+            let aligned = if align > 1 {
+                (offset + (align - 1)) & !(align - 1)
+            } else {
+                offset
+            };
+
+            // Bounds check
+            if aligned + size > radiotap_len || aligned + size > data.len() {
                 return None;
             }
-        };
 
-        // Apply alignment padding
-        let aligned = if align > 1 {
-            (offset + (align - 1)) & !(align - 1)
-        } else {
-            offset
-        };
+            // Extract RSSI from field 5 (antenna signal)
+            if field_index == 5 {
+                // RSSI is typically signed, convert to i8
+                rssi_opt = Some(data[aligned] as i8);
+            }
 
-        // Bounds check
-        if aligned + size > radiotap_len || aligned + size > data.len() {
-            return None;
+            offset = aligned + size;
         }
-
-        // Extract RSSI from field 5 (antenna signal)
-        if field == 5 {
-            // RSSI is typically signed, convert to i8
-            rssi_opt = Some(data[aligned] as i8);
-        }
-
-        offset = aligned + size;
     }
 
     // RSSI is required for a valid match
@@ -1084,7 +1152,6 @@ fn extract_80211_src_mac_and_rssi(data: &[u8]) -> Option<([u8; 6], i8)> {
     Some((src, rssi))
 }
 
-
 // (legacy integer RSSI helper removed — f32-based helper `rssi_f32_to_strength` used)
 
 /// Format MAC bytes as a colon-separated hex string
@@ -1118,16 +1185,25 @@ fn draw_signal_bars(ui: &mut egui::Ui, strength: f32, color: egui::Color32, desi
         let x = rect.left_top().x + i as f32 * (bar_width + spacing);
         let y = rect.bottom() - bar_h;
         let bar_rect = egui::Rect::from_min_size(egui::pos2(x, y), egui::vec2(bar_width, bar_h));
-        let fill = if strength >= frac { color } else { egui::Color32::from_gray(80) };
+        let fill = if strength >= frac {
+            color
+        } else {
+            egui::Color32::from_gray(80)
+        };
         // Slightly larger corner radius
         painter.rect_filled(bar_rect, egui::CornerRadius::same(6u8), fill);
     }
 }
 
-/// Format a raw hex string into uppercase colon-separated MAC pairs, max 6 bytes.
-fn format_mac_from_raw(raw: &str) -> String {
-    let mut r = raw.chars().filter(|c| c.is_ascii_hexdigit()).collect::<String>();
-    if r.len() > 12 { r.truncate(12); }
+/// Format raw hex (no separators) into uppercase colon-separated pairs, max 12 hex chars
+fn format_mac_from_hex(raw: &str) -> String {
+    let mut r = raw
+        .chars()
+        .filter(|c| c.is_ascii_hexdigit())
+        .collect::<String>();
+    if r.len() > 12 {
+        r.truncate(12);
+    }
     let mut parts: Vec<String> = Vec::new();
     let mut idx = 0usize;
     while idx < r.len() {
@@ -1186,4 +1262,3 @@ fn apply_pinnacle_theme(ctx: &egui::Context) {
 
     ctx.set_style(style);
 }
-
