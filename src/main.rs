@@ -97,7 +97,7 @@ fn command_exists(cmd: &str) -> bool {
     if let Ok(mut map) = cache.lock() {
         if let Some(&cached) = map.get(cmd) {
             return cached;
-        }
+       }
         let found = which::which(cmd).is_ok();
         map.insert(cmd.to_string(), found);
         found
