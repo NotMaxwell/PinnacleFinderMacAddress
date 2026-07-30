@@ -1218,6 +1218,358 @@ fn format_mac_from_hex(raw: &str) -> String {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- parse_mac ---
+
+    #[test]
+    fn parse_mac_valid_uppercase() {
+        assert_eq!(
+            parse_mac("AA:BB:CC:DD:EE:FF"),
+            Some([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF])
+        );
+    }
+
+    #[test]
+    fn parse_mac_valid_lowercase() {
+        assert_eq!(
+            parse_mac("aa:bb:cc:dd:ee:ff"),
+            Some([0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF])
+        );
+    }
+
+    #[test]
+    fn parse_mac_all_zeros() {
+        assert_eq!(
+            parse_mac("00:00:00:00:00:00"),
+            Some([0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+        );
+    }
+
+    #[test]
+    fn parse_mac_too_few_parts() {
+        assert_eq!(parse_mac("AA:BB:CC"), None);
+    }
+
+    #[test]
+    fn parse_mac_too_many_parts() {
+        assert_eq!(parse_mac("AA:BB:CC:DD:EE:FF:00"), None);
+    }
+
+    #[test]
+    fn parse_mac_segment_too_long() {
+        assert_eq!(parse_mac("AAA:BB:CC:DD:EE:FF"), None);
+    }
+
+    #[test]
+    fn parse_mac_segment_too_short() {
+        assert_eq!(parse_mac("A:BB:CC:DD:EE:FF"), None);
+    }
+
+    #[test]
+    fn parse_mac_invalid_hex() {
+        assert_eq!(parse_mac("GG:BB:CC:DD:EE:FF"), None);
+    }
+
+    #[test]
+    fn parse_mac_empty() {
+        assert_eq!(parse_mac(""), None);
+    }
+
+    // --- format_mac_bytes ---
+
+    #[test]
+    fn format_mac_bytes_standard() {
+        assert_eq!(
+            format_mac_bytes(&[0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF]),
+            "AA:BB:CC:DD:EE:FF"
+        );
+    }
+
+    #[test]
+    fn format_mac_bytes_zeros() {
+        assert_eq!(
+            format_mac_bytes(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]),
+            "00:00:00:00:00:00"
+        );
+    }
+
+    #[test]
+    fn format_mac_bytes_roundtrip() {
+        let mac = [0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC];
+        let s = format_mac_bytes(&mac);
+        assert_eq!(parse_mac(&s), Some(mac));
+    }
+
+    // --- format_mac_from_hex ---
+
+    #[test]
+    fn format_mac_from_hex_full() {
+        assert_eq!(format_mac_from_hex("AABBCCDDEEFF"), "AA:BB:CC:DD:EE:FF");
+    }
+
+    #[test]
+    fn format_mac_from_hex_lowercase_input() {
+        assert_eq!(format_mac_from_hex("aabbccddeeff"), "AA:BB:CC:DD:EE:FF");
+    }
+
+    #[test]
+    fn format_mac_from_hex_partial() {
+        assert_eq!(format_mac_from_hex("AABB"), "AA:BB");
+    }
+
+    #[test]
+    fn format_mac_from_hex_empty() {
+        assert_eq!(format_mac_from_hex(""), "");
+    }
+
+    #[test]
+    fn format_mac_from_hex_truncates_at_12() {
+        assert_eq!(format_mac_from_hex("AABBCCDDEEFF1122"), "AA:BB:CC:DD:EE:FF");
+    }
+
+    #[test]
+    fn format_mac_from_hex_strips_non_hex() {
+        // Colons and other non-hex chars are filtered out
+        assert_eq!(format_mac_from_hex("AA:BB:CC:DD:EE:FF"), "AA:BB:CC:DD:EE:FF");
+    }
+
+    // --- freq_to_channel ---
+
+    #[test]
+    fn freq_to_channel_2_4ghz_ch1() {
+        assert_eq!(freq_to_channel(2412), Some(1));
+    }
+
+    #[test]
+    fn freq_to_channel_2_4ghz_ch6() {
+        assert_eq!(freq_to_channel(2437), Some(6));
+    }
+
+    #[test]
+    fn freq_to_channel_2_4ghz_ch11() {
+        assert_eq!(freq_to_channel(2462), Some(11));
+    }
+
+    #[test]
+    fn freq_to_channel_5ghz_ch36() {
+        assert_eq!(freq_to_channel(5180), Some(36));
+    }
+
+    #[test]
+    fn freq_to_channel_5ghz_ch40() {
+        assert_eq!(freq_to_channel(5200), Some(40));
+    }
+
+    #[test]
+    fn freq_to_channel_below_range() {
+        assert_eq!(freq_to_channel(2411), None);
+    }
+
+    #[test]
+    fn freq_to_channel_between_bands() {
+        assert_eq!(freq_to_channel(3000), None);
+    }
+
+    #[test]
+    fn freq_to_channel_above_range() {
+        assert_eq!(freq_to_channel(6001), None);
+    }
+
+    // --- rssi_f32_to_strength ---
+
+    #[test]
+    fn rssi_strength_at_min() {
+        assert!((rssi_f32_to_strength(-100.0) - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rssi_strength_at_max() {
+        assert!((rssi_f32_to_strength(-30.0) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rssi_strength_midpoint() {
+        let strength = rssi_f32_to_strength(-65.0);
+        assert!((strength - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn rssi_strength_clamped_low() {
+        assert!((rssi_f32_to_strength(-120.0) - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rssi_strength_clamped_high() {
+        assert!((rssi_f32_to_strength(0.0) - 1.0).abs() < 1e-6);
+    }
+
+    // --- extract_80211_src_mac_and_rssi ---
+
+    // Builds a minimal valid radiotap + 802.11 frame.
+    // Radiotap: version=0, pad=0, len=9, present=0x20 (bit 5 = antenna signal), rssi byte.
+    // 802.11: frame_control, duration, addr1, addr2, addr3, seq_ctrl, optional addr4.
+    fn build_radiotap_80211(
+        rssi: i8,
+        frame_control: u16,
+        addr1: [u8; 6],
+        addr2: [u8; 6],
+        addr3: [u8; 6],
+        addr4: Option<[u8; 6]>,
+    ) -> Vec<u8> {
+        let radiotap_len: u16 = 9;
+        let mut pkt: Vec<u8> = vec![
+            0x00, 0x00,
+            (radiotap_len & 0xFF) as u8, (radiotap_len >> 8) as u8,
+            0x20, 0x00, 0x00, 0x00, // present bitmask: bit 5 (antenna signal)
+            rssi as u8,
+        ];
+        pkt.push((frame_control & 0xFF) as u8);
+        pkt.push((frame_control >> 8) as u8);
+        pkt.extend_from_slice(&[0x00, 0x00]); // duration
+        pkt.extend_from_slice(&addr1);
+        pkt.extend_from_slice(&addr2);
+        pkt.extend_from_slice(&addr3);
+        pkt.extend_from_slice(&[0x00, 0x00]); // seq control
+        if let Some(a4) = addr4 {
+            pkt.extend_from_slice(&a4);
+        }
+        pkt
+    }
+
+    #[test]
+    fn extract_mgmt_no_ds_returns_addr2_as_src() {
+        let src_mac = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        // Management frame (type 0), no DS bits → src = addr2
+        let pkt = build_radiotap_80211(
+            -60,
+            0x0000,
+            [0x11; 6],
+            src_mac,
+            [0x22; 6],
+            None,
+        );
+        let result = extract_80211_src_mac_and_rssi(&pkt);
+        assert_eq!(result, Some((src_mac, -60i8)));
+    }
+
+    #[test]
+    fn extract_data_to_ds_returns_addr2_as_src() {
+        let src_mac = [0xCA, 0xFE, 0xBA, 0xBE, 0x00, 0x01];
+        // Data frame (type 2 = 0x08 in FC byte 0), to_ds=1 (bit 8 in u16) → src = addr2
+        let pkt = build_radiotap_80211(
+            -75,
+            0x0108, // type=data, to_ds=1
+            [0x33; 6],
+            src_mac,
+            [0x44; 6],
+            None,
+        );
+        let result = extract_80211_src_mac_and_rssi(&pkt);
+        assert_eq!(result, Some((src_mac, -75i8)));
+    }
+
+    #[test]
+    fn extract_data_from_ds_returns_addr3_as_src() {
+        let src_mac = [0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x02];
+        // Data frame, from_ds=1 (bit 9) → src = addr3
+        let pkt = build_radiotap_80211(
+            -80,
+            0x0208, // type=data, from_ds=1
+            [0x55; 6],
+            [0x66; 6],
+            src_mac,
+            None,
+        );
+        let result = extract_80211_src_mac_and_rssi(&pkt);
+        assert_eq!(result, Some((src_mac, -80i8)));
+    }
+
+    #[test]
+    fn extract_data_wds_returns_addr4_as_src() {
+        let src_mac = [0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F];
+        // WDS frame: to_ds=1 and from_ds=1 → src = addr4
+        let pkt = build_radiotap_80211(
+            -50,
+            0x0308, // type=data, to_ds=1, from_ds=1
+            [0x77; 6],
+            [0x88; 6],
+            [0x99; 6],
+            Some(src_mac),
+        );
+        let result = extract_80211_src_mac_and_rssi(&pkt);
+        assert_eq!(result, Some((src_mac, -50i8)));
+    }
+
+    #[test]
+    fn extract_control_frame_returns_none() {
+        // Control frame (type 1 = bits 3:2 = 01 → FC byte 0 = 0x04)
+        let pkt = build_radiotap_80211(
+            -55,
+            0x0004, // type=ctrl
+            [0xAA; 6],
+            [0xBB; 6],
+            [0xCC; 6],
+            None,
+        );
+        assert_eq!(extract_80211_src_mac_and_rssi(&pkt), None);
+    }
+
+    #[test]
+    fn extract_too_short_returns_none() {
+        assert_eq!(extract_80211_src_mac_and_rssi(&[0u8; 4]), None);
+    }
+
+    #[test]
+    fn extract_wrong_version_returns_none() {
+        let mut pkt = build_radiotap_80211(-60, 0x0000, [0x11; 6], [0xAA; 6], [0x22; 6], None);
+        pkt[0] = 1; // corrupt version byte
+        assert_eq!(extract_80211_src_mac_and_rssi(&pkt), None);
+    }
+
+    #[test]
+    fn extract_rssi_value_preserved() {
+        let pkt = build_radiotap_80211(-42, 0x0000, [0x11; 6], [0xAA; 6], [0x22; 6], None);
+        let (_, rssi) = extract_80211_src_mac_and_rssi(&pkt).unwrap();
+        assert_eq!(rssi, -42i8);
+    }
+
+    // --- packet_contains_mac ---
+
+    #[test]
+    fn packet_contains_mac_via_radiotap_parse() {
+        let target = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        let pkt = build_radiotap_80211(-60, 0x0000, [0x11; 6], target, [0x22; 6], None);
+        assert!(packet_contains_mac(&pkt, &target));
+    }
+
+    #[test]
+    fn packet_contains_mac_raw_fallback() {
+        // Craft a packet that won't parse as valid radiotap (version byte != 0)
+        // but contains the target MAC as a raw byte sequence.
+        let target = [0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02];
+        let mut pkt = vec![0xFFu8; 20]; // invalid radiotap version
+        pkt.extend_from_slice(&target);
+        assert!(packet_contains_mac(&pkt, &target));
+    }
+
+    #[test]
+    fn packet_contains_mac_no_match() {
+        let target = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        let other = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66];
+        let pkt = build_radiotap_80211(-60, 0x0000, [0x11; 6], other, [0x22; 6], None);
+        assert!(!packet_contains_mac(&pkt, &target));
+    }
+
+    #[test]
+    fn packet_contains_mac_empty_packet() {
+        let target = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF];
+        assert!(!packet_contains_mac(&[], &target));
+    }
+}
+
 fn main() {
     let options = NativeOptions::default();
     if let Err(e) = run_native(
